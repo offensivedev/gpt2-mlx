@@ -4,6 +4,7 @@ from functools import partial
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
+from mlx.optimizers.optimizers import clip_grad_norm
 
 from dataloader import DataLoaderLite
 from gpt2 import GPT, GPTConfig
@@ -18,7 +19,15 @@ model.apply(lambda x: x.astype(mx.bfloat16))
 
 train_loader = DataLoaderLite(B=16, T=1024)
 
-optimizer = optim.AdamW(learning_rate=1e-4)
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+linear_schedule = optim.linear_schedule(max_lr * 1 / warmup_steps, max_lr, warmup_steps)
+cosine_schedule = optim.cosine_decay(max_lr, max_steps - warmup_steps, min_lr)
+lr_schedule = optim.join_schedules([linear_schedule, cosine_schedule], [warmup_steps])
+
+optimizer = optim.AdamW(learning_rate=lr_schedule, betas=[0.9, 0.95], eps=1e-8)
 optimizer.init(model.trainable_parameters())
 
 
@@ -47,7 +56,8 @@ def step(x, y):
     # There's no accumulation happening in the background.
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
     loss, grads = loss_and_grad_fn(model, x, y)
-    optimizer.update(model, grads)
+    clipped_grads, _ = clip_grad_norm(grads, max_norm=1.0)
+    optimizer.update(model, clipped_grads)
     return loss
 
 
