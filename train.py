@@ -27,11 +27,17 @@ linear_schedule = optim.linear_schedule(max_lr * 1 / warmup_steps, max_lr, warmu
 cosine_schedule = optim.cosine_decay(max_lr, max_steps - warmup_steps, min_lr)
 lr_schedule = optim.join_schedules([linear_schedule, cosine_schedule], [warmup_steps])
 
-optimizer = optim.AdamW(learning_rate=lr_schedule, betas=[0.9, 0.95], eps=1e-8)
-optimizer.init(model.trainable_parameters())
-
 optimizer_decay = optim.AdamW(learning_rate=1e-4, weight_decay=0.01)
 optimizer_skip_decay = optim.AdamW(learning_rate=1e-3, weight_decay=0.0)
+
+total_batch_size = 524288  # 2**19, ~0.5M number of tokens
+B = 16  # micro-batch size
+T = 1024  # sequence length
+assert total_batch_size % (B * T) == 0, (
+    "make sure total_batch_size is divisible by B * T"
+)
+grad_accum_steps = total_batch_size // (B * T)
+print(f"Using gradient accumulation over {grad_accum_steps} steps")
 
 
 def split_grads_by_weight_decay(grads, grads_to_decay, grads_to_skip_decay):
@@ -88,17 +94,24 @@ def loss_fn(model, x, y):
 # See https://github.com/ml-explore/mlx-examples/blob/main/transformer_lm/main.py for an example of using mx.compile with optimizers
 # I observed marginal improvements on M3 Max to training efficiency. token/sec went from 10k to 11.5k
 # GPU was already close to full utilization
-state = [model.state, optimizer.state]
+state = [model.state, optimizer_decay.state, optimizer_skip_decay.state]
 
 
-@partial(mx.compile, inputs=state, outputs=state)
-def step(x, y):
-    # When calling value_and_grad(), it computes the gradients from scratch for that specific forward pass.
-    # There's no accumulation happening in the background.
-    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
-    loss, grads = loss_and_grad_fn(model, x, y)
+# @partial(mx.compile, inputs=state, outputs=state)
+def step():
+    loss_accum = 0.0
+    for _ in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        # When calling value_and_grad(), it computes the gradients from scratch for that specific forward pass.
+        # There's no accumulation happening in the background.
+        loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+        loss, grads = loss_and_grad_fn(model, x, y)
+        mx.eval(grads)
+        loss /= grad_accum_steps  # average the loss over gradient accumulation steps
+        loss_accum += loss
 
     # Implement gradient clipping and weight decay
+    # https://github.com/ml-explore/mlx/issues/2837 has more details
     grads_to_decay, grads_to_skip_decay = {}, {}
     split_grads_by_weight_decay(grads, grads_to_decay, grads_to_skip_decay)
 
@@ -106,21 +119,22 @@ def step(x, y):
     clipped_grads_to_skip_decay, _ = clip_grad_norm(grads_to_skip_decay, max_norm=1.0)
     optimizer_decay.update(model, clipped_grads_to_decay)
     optimizer_skip_decay.update(model, clipped_grads_to_skip_decay)
-    return loss
+    return loss_accum
 
 
-for i in range(50):
+for i in range(3):
     # Run 'sudo asitop' to monitor CPU usage
     t0 = time.time()
-    x, y = train_loader.next_batch()
+
     # Unlike in PyTorch, no need for zero_grad() in MLX.
-    loss = step(x, y)
+    loss = step()
 
     # Evaluate state after update to ensure changes are applied (MLX is lazy)
     mx.eval(state)
+    mx.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000
-    tokens_per_sec = (x.shape[0] * x.shape[1]) / (t1 - t0)
+    tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / (t1 - t0)
 
     # Evaluate loss to get actual value
     loss_val = float(loss)
