@@ -1,3 +1,4 @@
+import gc
 import time
 from functools import partial
 
@@ -5,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.optimizers.optimizers import clip_grad_norm
+from mlx.utils import tree_map
 
 from dataloader import DataLoaderLite
 from gpt2 import GPT, GPTConfig
@@ -97,28 +99,47 @@ def loss_fn(model, x, y):
 state = [model.state, optimizer_decay.state, optimizer_skip_decay.state]
 
 
+# Create loss_and_grad_fn once outside the loop to avoid recreating it
+loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+
+
 # @partial(mx.compile, inputs=state, outputs=state)
 def step():
     loss_accum = 0.0
-    for _ in range(grad_accum_steps):
+    grads_accum = None
+    for accum_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
-        # When calling value_and_grad(), it computes the gradients from scratch for that specific forward pass.
-        # There's no accumulation happening in the background.
-        loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
         loss, grads = loss_and_grad_fn(model, x, y)
-        mx.eval(grads)
-        loss /= grad_accum_steps  # average the loss over gradient accumulation steps
-        loss_accum += loss
+        # Evaluate loss and gradients immediately to materialize them and free computation graph
+        mx.eval(loss, grads)
+
+        # Accumulate gradients
+        if grads_accum is None:
+            grads_accum = grads
+        else:
+            # Unlike in PyTorch, each forward pass computes the gradients from scratch for that specific forward pass
+            # There's no accumulation happenin, hence manual accumulation via tree_map is needed
+            # tree_map applies the given function recursively to each leaf node in the tree structure
+            grads_accum = tree_map(lambda a, b: a + b, grads_accum, grads)
+            # Evaluate the accumulated result immediately to free computation graph
+            mx.eval(grads_accum)
+
+        # Convert loss to float (triggers evaluation automatically)
+        loss_val = float(loss) / grad_accum_steps
+        loss_accum += loss_val
+
+    mx.eval(loss_accum, grads_accum)
 
     # Implement gradient clipping and weight decay
     # https://github.com/ml-explore/mlx/issues/2837 has more details
     grads_to_decay, grads_to_skip_decay = {}, {}
-    split_grads_by_weight_decay(grads, grads_to_decay, grads_to_skip_decay)
+    split_grads_by_weight_decay(grads_accum, grads_to_decay, grads_to_skip_decay)
 
     clipped_grads_to_decay, _ = clip_grad_norm(grads_to_decay, max_norm=1.0)
     clipped_grads_to_skip_decay, _ = clip_grad_norm(grads_to_skip_decay, max_norm=1.0)
     optimizer_decay.update(model, clipped_grads_to_decay)
     optimizer_skip_decay.update(model, clipped_grads_to_skip_decay)
+    mx.eval(model.parameters())
     return loss_accum
 
 
@@ -128,16 +149,15 @@ for i in range(3):
 
     # Unlike in PyTorch, no need for zero_grad() in MLX.
     loss = step()
-
-    # Evaluate state after update to ensure changes are applied (MLX is lazy)
-    mx.eval(state)
-    mx.synchronize()
+    # Evaluate model parameters after compiled function returns
+    # This ensures optimizer updates are materialized and helps with memory management
+    mx.eval(model.parameters())
     t1 = time.time()
     dt = (t1 - t0) * 1000
     tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / (t1 - t0)
 
-    # Evaluate loss to get actual value
-    loss_val = float(loss)
+    # loss is already a Python float from step(), but ensure it's not an array
+    loss_val = float(loss) if isinstance(loss, mx.array) else loss
     print(f"step {i}: loss {loss_val}, dt {dt:.2f}ms, tok/sec {tokens_per_sec:.2f}")
 
 output = generate_text(
