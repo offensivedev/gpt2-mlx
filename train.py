@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import time
 from functools import partial
@@ -13,9 +14,7 @@ from mlx.utils import tree_map
 from checkpoint import load_checkpoint, save_checkpoint
 from dataloader import DataLoaderLite
 from gpt2 import GPT, GPTConfig
-from inference import generate_text
-
-VOCAB_SIZE = 50304  # GPT-2 vocabulary size
+from inference import VOCAB_SIZE, generate_text
 
 logging.basicConfig(
     filename=os.path.join(os.path.dirname(__file__), "logs.txt"),
@@ -51,6 +50,27 @@ max_steps = 19073
 linear_schedule = optim.linear_schedule(max_lr * 1 / warmup_steps, max_lr, warmup_steps)
 cosine_schedule = optim.cosine_decay(max_lr, max_steps - warmup_steps, min_lr)
 lr_schedule = optim.join_schedules([linear_schedule, cosine_schedule], [warmup_steps])
+
+
+def get_lr_python(step: int) -> float:
+    """
+    Compute learning rate using pure Python math (faster than MLX for logging).
+    The alternative is to call mx.eval(lr_schedule(step)), which is much slower, causing token throughput
+    to drop from ~11.5k to ~7.5k on M3 Max.
+    """
+
+    if step < warmup_steps:
+        # Linear warmup
+        init_lr = max_lr * 1 / warmup_steps
+        return init_lr + step * ((max_lr - init_lr) / warmup_steps)
+    else:
+        # Cosine decay
+        decay_steps = max_steps - warmup_steps
+        step_in_decay = step - warmup_steps
+        progress = min(step_in_decay / decay_steps, 1.0)
+        decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr + decay * (max_lr - min_lr)
+
 
 # Create optimizers for parameters with and without weight decay
 optimizer_decay = optim.AdamW(learning_rate=1e-4, weight_decay=0.01)
@@ -149,13 +169,13 @@ def step():
 
     # Implement gradient clipping
     # https://github.com/ml-explore/mlx/issues/2837 has more details
-    clipped_grads, _ = clip_grad_norm(grads_accum, max_norm=1.0)
+    clipped_grads, grad_norm = clip_grad_norm(grads_accum, max_norm=1.0)
 
     # MultiOptimizer automatically routes parameters to the correct optimizer
     # based on the filter function (weight decay for ndim >= 2, no decay for ndim < 2)
     optimizer.update(model, clipped_grads)
     mx.eval(model.parameters())
-    return loss_accum
+    return loss_accum, grad_norm
 
 
 for i in range(start_step, max_steps):
@@ -187,7 +207,7 @@ for i in range(start_step, max_steps):
         )
 
     # Unlike in PyTorch, no need for zero_grad() in MLX.
-    loss = step()
+    loss, grad_norm = step()
     # Evaluate model parameters after compiled function returns
     # This ensures optimizer updates are materialized and helps with memory management
     mx.eval(model.parameters())
@@ -197,8 +217,13 @@ for i in range(start_step, max_steps):
 
     # loss is already a Python float from step(), but ensure it's not an array
     loss_val = float(loss) if isinstance(loss, mx.array) else loss
+    grad_norm_val = float(grad_norm) if isinstance(grad_norm, mx.array) else grad_norm
+
+    # Get current learning rate using pure Python math (faster than MLX evaluation)
+    current_lr = get_lr_python(i)
+
     logger.info(
-        f"step {i}: loss {loss_val}, dt {dt:.2f}ms, tok/sec {tokens_per_sec:.2f}"
+        f"step {i}: loss {loss_val}, grad_norm {grad_norm_val:.6f}, lr {current_lr:.2e}, dt {dt:.2f}ms, tok/sec {tokens_per_sec:.2f}"
     )
 
 output = generate_text(

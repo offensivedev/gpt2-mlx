@@ -1,7 +1,7 @@
 import mlx.core as mx
 import tiktoken
 
-from train import VOCAB_SIZE
+VOCAB_SIZE = 50304  # GPT-2 vocabulary size
 
 
 def generate_text(model, prompt, max_new_tokens=100, temperature=1.0, top_k=None):

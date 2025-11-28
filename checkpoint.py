@@ -63,8 +63,10 @@ def load_checkpoint(model, optimizer, checkpoint_dir):
     # Load optimizer state (unflatten nested structure)
     optimizer_state_path = os.path.join(checkpoint_path, "optimizer_state.npz")
     if os.path.exists(optimizer_state_path):
-        flat_state = mx.load(optimizer_state_path)
-        optimizer_state = tree_unflatten(flat_state)
+        flat_state_dict = mx.load(optimizer_state_path)
+        # Convert dict to list of tuples for tree_unflatten
+        flat_state_list = list(flat_state_dict.items())
+        optimizer_state = tree_unflatten(flat_state_list)
         optimizer.state = optimizer_state
 
     logger.info(f"Resumed training from checkpoint at step {step} ({checkpoint_path})")
