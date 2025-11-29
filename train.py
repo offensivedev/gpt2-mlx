@@ -29,8 +29,6 @@ logger = logging.getLogger("mlx-gpt")
 # Checkpoint directory
 checkpoint_dir = "checkpoints"
 os.makedirs(checkpoint_dir, exist_ok=True)
-
-
 model = GPT(GPTConfig(vocab_size=VOCAB_SIZE))
 # Initialize model parameters (MLX is lazy by default)
 mx.eval(model.parameters())
@@ -58,7 +56,6 @@ def get_lr_python(step: int) -> float:
     The alternative is to call mx.eval(lr_schedule(step)), which is much slower, causing token throughput
     to drop from ~11.5k to ~7.5k on M3 Max.
     """
-
     if step < warmup_steps:
         # Linear warmup
         init_lr = max_lr * 1 / warmup_steps
@@ -73,8 +70,8 @@ def get_lr_python(step: int) -> float:
 
 
 # Create optimizers for parameters with and without weight decay
-optimizer_decay = optim.AdamW(learning_rate=1e-4, weight_decay=0.01)
-optimizer_skip_decay = optim.AdamW(learning_rate=1e-3, weight_decay=0.0)
+optimizer_decay = optim.AdamW(learning_rate=lr_schedule, weight_decay=0.01)
+optimizer_skip_decay = optim.AdamW(learning_rate=lr_schedule, weight_decay=0.0)
 
 
 # Filter function for MultiOptimizer: returns True for parameters that should have weight decay
@@ -91,7 +88,7 @@ optimizer = optim.MultiOptimizer(
 )
 
 # Try to load checkpoint and resume training
-start_step = load_checkpoint(model, optimizer, checkpoint_dir)
+start_step, _ = load_checkpoint(model, optimizer, checkpoint_dir, data_loader=train_loader)
 
 total_batch_size = 524288  # 2**19, ~0.5M number of tokens
 B = 32  # micro-batch size
@@ -184,7 +181,7 @@ for i in range(start_step, max_steps):
 
     # Save checkpoint periodically (every 1000 steps) and at validation steps (every 100 steps)
     if i > 0 and (i % 1000 == 0 or (i % 100 == 0 and i % 1000 != 0)):
-        save_checkpoint(model, optimizer, i, checkpoint_dir)
+        save_checkpoint(model, optimizer, i, checkpoint_dir, data_loader=train_loader)
 
     if i > 0 and i % 100 == 0 or i == max_steps - 1:
         val_loader.reset()
@@ -217,10 +214,8 @@ for i in range(start_step, max_steps):
 
     # loss is already a Python float from step(), but ensure it's not an array
     loss_val = float(loss) if isinstance(loss, mx.array) else loss
-    grad_norm_val = float(grad_norm) if isinstance(grad_norm, mx.array) else grad_norm
-
-    # Get current learning rate using pure Python math (faster than MLX evaluation)
     current_lr = get_lr_python(i)
+    grad_norm_val = float(grad_norm)
 
     logger.info(
         f"step {i}: loss {loss_val}, grad_norm {grad_norm_val:.6f}, lr {current_lr:.2e}, dt {dt:.2f}ms, tok/sec {tokens_per_sec:.2f}"
@@ -236,5 +231,5 @@ output = generate_text(
 logger.info(output)
 
 # Save final checkpoint
-save_checkpoint(model, optimizer, max_steps - 1, checkpoint_dir, is_final=True)
+save_checkpoint(model, optimizer, max_steps - 1, checkpoint_dir, is_final=True, data_loader=train_loader)
 logger.info("Training completed. Final checkpoint saved.")
