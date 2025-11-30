@@ -2,7 +2,7 @@
 
 A minimal GPT-2 implementation using Apple's MLX framework, inspired by [Andrej Karpathy's NanoGPT](https://github.com/karpathy/nanoGPT).
 
-This project implements a GPT-2 transformer model with training and inference capabilities, optimized for Apple Silicon using MLX's unified memory architecture.
+This project implements a GPT-2 transformer model with training and inference capabilities, optimized for Apple Silicon using MLX's unified memory architecture. I documented learnings and pitfalls encountered during development in [Learnings from Implementing GPT-2 from Scratch using MLX](./blogpost.md). 
 
 ## Features
 
@@ -45,4 +45,4 @@ The `inference.py` module provides a `generate_text()` function that can be used
 - `train.py` - Training script
 - `inference.py` - Text generation utilities
 - `dataloader.py` - Data loading and batching
-
+- `checkpoint.py` - Model checkpointing utilities
